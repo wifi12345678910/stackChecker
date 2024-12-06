@@ -147,7 +147,9 @@ void VG_(HT_add_node) ( VgHashTable *table, void* vnode )
    while (table->chain[idx])
    {
       idx++;
-      if (idx > table->max_size-1) {
+
+    if (idx > table->max_size-1) {
+
          resize(table);
       }
    }
