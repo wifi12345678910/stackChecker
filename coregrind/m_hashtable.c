@@ -38,15 +38,15 @@
 /*--- Declarations                                                 ---*/
 /*--------------------------------------------------------------------*/
 
-#define CHAIN_NO(key,tbl) (((UWord)(key)) % tbl->n_chains)
+#define CHAIN_NO(key,tbl) (((ULong)(key)) % tbl->max_size)
 
 struct _VgHashTable {
-   UInt         n_chains;   // should be prime
+   SizeT        max_size;   // should be prime
    UInt         n_elements;
    VgHashNode*  iterNode;   // current iterator node
    UInt         iterChain;  // next chain to be traversed by the iterator
    Bool         iterOK;     // table safe to iterate over?
-   VgHashNode** chains;     // expanding array of hash chains
+   VgHashNode** chain;     // expanding array of hash chains
    const HChar* name;       // name of table (for debugging only)
 };
 
@@ -67,15 +67,16 @@ static const SizeT primes[N_HASH_PRIMES] = {
 VgHashTable *VG_(HT_construct) ( const HChar* name )
 {
    /* Initialises to zero, ie. all entries NULL */
-   SizeT       n_chains = primes[0];
-   SizeT       sz       = n_chains * sizeof(VgHashNode*);
+   SizeT       max_size = primes[0];
+   SizeT       sz       = max_size * sizeof(VgHashNode*);
    VgHashTable *table   = VG_(calloc)("hashtable.Hc.1",
                                       1, sizeof(struct _VgHashTable));
-   table->chains        = VG_(calloc)("hashtable.Hc.2", 1, sz);
-   table->n_chains      = n_chains;
+   table->chain        = VG_(calloc)("hashtable.Hc.2", 1, sz);
+   //table->n_chains      = n_chains;
    table->n_elements    = 0;
    table->iterOK        = True;
    table->name          = name;
+   table->max_size = max_size;
    vg_assert(name);
    return table;
 }
@@ -89,7 +90,7 @@ static void resize ( VgHashTable *table )
 {
    Int          i;
    SizeT        sz;
-   SizeT        old_chains = table->n_chains;
+   SizeT        old_chains = table->max_size;
    SizeT        new_chains = old_chains + 1;
    VgHashNode** chains;
    VgHashNode * node;
@@ -118,23 +119,22 @@ static void resize ( VgHashTable *table )
          table->name, (UWord)old_chains, (UWord)new_chains,
          (UWord)table->n_elements );
 
-   table->n_chains = new_chains;
+   table->max_size = new_chains;
    sz = new_chains * sizeof(VgHashNode*);
    chains = VG_(calloc)("hashtable.resize.1", 1, sz);
 
    for (i = 0; i < old_chains; i++) {
-      node = table->chains[i];
-      while (node != NULL) {
-         VgHashNode* next = node->next;
-         UWord chain = CHAIN_NO(node->key, table);
-         node->next = chains[chain];
-         chains[chain] = node;
-         node = next;
+      node = table->chain[i];
+    //     printf("131");
+      if(node != NULL) {
+         ULong idx = CHAIN_NO(node->key,table);
+         while (chains[idx] == NULL) {idx++;}
+            chains[idx] = node;
       }
    }
 
-   VG_(free)(table->chains);
-   table->chains = chains;
+   VG_(free)(table->chain);
+   table->chain = chains;
 }
 
 /* Puts a new, heap allocated VgHashNode, into the VgHashTable.  Prepends
@@ -142,13 +142,19 @@ static void resize ( VgHashTable *table )
 void VG_(HT_add_node) ( VgHashTable *table, void* vnode )
 {
    VgHashNode* node     = (VgHashNode*)vnode;
-   UWord chain          = CHAIN_NO(node->key, table);
-   node->next           = table->chains[chain];
-   table->chains[chain] = node;
-   table->n_elements++;
-   if ( (1 * (ULong)table->n_elements) > (1 * (ULong)table->n_chains) ) {
-      resize(table);
+//   printf("154");
+   UWord idx          = CHAIN_NO(node->key, table);
+   while (table->chain[idx])
+   {
+      idx++;
+      if (idx == table->max_size-1) {
+         resize(table);
+      }
    }
+   table->chain[idx] = node;
+   table->chain[idx]->next = NULL;
+   
+   table->n_elements++;
 
    /* Table has been modified; hence HT_Next should assert. */
    table->iterOK = False;
@@ -157,13 +163,17 @@ void VG_(HT_add_node) ( VgHashTable *table, void* vnode )
 /* Looks up a VgHashNode by key in the table.  Returns NULL if not found. */
 void* VG_(HT_lookup) ( const VgHashTable *table, UWord key )
 {
-   VgHashNode* curr = table->chains[ CHAIN_NO(key, table) ];
+  // printf("177");
+  ULong idx = CHAIN_NO(key, table) ;
+   VgHashNode* curr = table->chain[ idx];
 
    while (curr) {
       if (key == curr->key) {
          return curr;
       }
-      curr = curr->next;
+      idx++;
+      if (idx >= table->max_size){break;}
+      curr = table->chain[idx];
    }
    return NULL;
 }
@@ -174,13 +184,20 @@ void* VG_(HT_gen_lookup) ( const VgHashTable *table, const void* node,
                            HT_Cmp_t cmp )
 {
    const VgHashNode* hnode = node; // GEN!!!
-   VgHashNode* curr = table->chains[ CHAIN_NO(hnode->key, table) ]; // GEN!!!
+ //  printf("195");
+   if (table->max_size == 0) {
+      return NULL;
+   }
+   ULong idx = CHAIN_NO(hnode->key, table);
+   VgHashNode* curr = table->chain[ idx ]; // GEN!!!
 
    while (curr) {
       if (hnode->key == curr->key && cmp (hnode, curr) == 0) { // GEN!!!
          return curr;
       }
-      curr = curr->next;
+      idx++;
+      if (idx >= table->max_size){break;}
+      curr = table->chain[idx];
    }
    return NULL;
 }
@@ -188,21 +205,29 @@ void* VG_(HT_gen_lookup) ( const VgHashTable *table, const void* node,
 /* Removes a VgHashNode from the table.  Returns NULL if not found. */
 void* VG_(HT_remove) ( VgHashTable *table, UWord key )
 {
-   UWord        chain         = CHAIN_NO(key, table);
-   VgHashNode*  curr          =   table->chains[chain];
-   VgHashNode** prev_next_ptr = &(table->chains[chain]);
+  // printf("210");
+   UWord        idx         = CHAIN_NO(key, table);
+   VgHashNode*  curr          =   table->chain[idx];
+   //VgHashNode** prev_next_ptr = &(table->chain[idx]);
 
    /* Table has been modified; hence HT_Next should assert. */
    table->iterOK = False;
 
-   while (curr) {
+   for (UWord j = 0; j < table->n_elements; j++){
       if (key == curr->key) {
-         *prev_next_ptr = curr->next;
+      //   *prev_next_ptr = curr->next;
          table->n_elements--;
          return curr;
       }
-      prev_next_ptr = &(curr->next);
-      curr = curr->next;
+      for (UWord i = 0; i+j < table->max_size; i++) {
+         if (table->chain[i] != NULL){
+            curr = table->chain[i];
+      //      prev_next_ptr = &(curr);
+            break;
+         } else {
+               curr = NULL;
+         }
+      }
    }
    return NULL;
 }
@@ -212,35 +237,43 @@ void* VG_(HT_remove) ( VgHashTable *table, UWord key )
 void* VG_(HT_gen_remove) ( VgHashTable *table, const void* node, HT_Cmp_t cmp  )
 {
    const VgHashNode* hnode    = node; // GEN!!!
-   UWord        chain         = CHAIN_NO(hnode->key, table); // GEN!!!
-   VgHashNode*  curr          =   table->chains[chain];
-   VgHashNode** prev_next_ptr = &(table->chains[chain]);
+  // printf("235");
+   UWord        idx         = CHAIN_NO(hnode->key, table); // GEN!!!
+   VgHashNode*  curr          =   table->chain[idx];
+  //   VgHashNode** prev_next_ptr = &(table->chain[idx]);
 
    /* Table has been modified; hence HT_Next should assert. */
    table->iterOK = False;
 
    while (curr) {
       if (hnode->key == curr->key && cmp(hnode, curr) == 0) { // GEN!!!
-         *prev_next_ptr = curr->next;
+  //       *prev_next_ptr = curr->next;
          table->n_elements--;
          return curr;
       }
-      prev_next_ptr = &(curr->next);
-      curr = curr->next;
+      for (UWord i = 0; i +idx < table->max_size; i++) {
+            if (table->chain[i] != NULL){
+               curr = table->chain[i];
+            //   prev_next_ptr = &(curr);
+               break;
+            } else {
+            curr = NULL;
+         }
+      }
    }
    return NULL;
 }
 
 void VG_(HT_print_stats) ( const VgHashTable *table, HT_Cmp_t cmp )
 {
-   #define MAXOCCUR 20
+ /*  #define MAXOCCUR 20
    UInt elt_occurences[MAXOCCUR+1];
    UInt key_occurences[MAXOCCUR+1];
    UInt cno_occurences[MAXOCCUR+1];
-   /* Key occurence  : how many ht elements have the same key.
+    Key occurence  : how many ht elements have the same key.
       elt_occurences : how many elements are inserted multiple time.
       cno_occurences : how many chains have that length.
-      The last entry in these arrays collects all occurences >= MAXOCCUR. */
+      The last entry in these arrays collects all occurences >= MAXOCCUR. 
    #define INCOCCUR(occur,n) (n >= MAXOCCUR ? occur[MAXOCCUR]++ : occur[n]++)
    UInt i;
    UInt nkey, nelt, ncno;
@@ -319,6 +352,7 @@ void VG_(HT_print_stats) ( const VgHashTable *table, HT_Cmp_t cmp )
                 ncno, nkey, nelt,
                 (Double)nelt/(Double)(ncno == cno_occurences[0] ?
                                       1 : ncno - cno_occurences[0]));
+   */
 }
 
 
@@ -328,7 +362,7 @@ void VG_(HT_print_stats) ( const VgHashTable *table, HT_Cmp_t cmp )
 */
 VgHashNode** VG_(HT_to_array) (const VgHashTable *table, /*OUT*/ UInt* n_elems)
 {
-   UInt       i, j;
+   UInt        j;
    VgHashNode** arr;
    VgHashNode*  node;
 
@@ -339,9 +373,12 @@ VgHashNode** VG_(HT_to_array) (const VgHashTable *table, /*OUT*/ UInt* n_elems)
    arr = VG_(malloc)( "hashtable.Hta.1", *n_elems * sizeof(VgHashNode*) );
 
    j = 0;
-   for (i = 0; i < table->n_chains; i++) {
-      for (node = table->chains[i]; node != NULL; node = node->next) {
+   for (UInt i = 0; i<table->max_size; i++) {
+      node = table->chain[i];
+      while (node){
          arr[j++] = node;
+         node = node->next;
+         i++;
       }
    }
    vg_assert(j == *n_elems);
@@ -370,12 +407,13 @@ void* VG_(HT_Next)(VgHashTable *table)
 
    if (table->iterNode && table->iterNode->next) {
       table->iterNode = table->iterNode->next;
+      table->iterChain++;
       return table->iterNode;
    }
 
-   for (i = table->iterChain; i < table->n_chains; i++) {
-      if (table->chains[i]) {
-         table->iterNode  = table->chains[i];
+   for (i = table->iterChain; i < table->max_size; i++) {
+      if (table->chain[i] != NULL) {
+         table->iterNode  = table->chain[i];
          table->iterChain = i + 1;  // Next chain to be traversed
          return table->iterNode;
       }
@@ -391,26 +429,7 @@ void VG_(HT_remove_at_Iter)(VgHashTable *table)
 
    const UInt curChain = table->iterChain - 1; // chain of iterNode.
    
-
-   if (table->chains[curChain] == table->iterNode) {
-      /* iterNode is the first of its chain -> remove it from the chain. */
-      table->chains[curChain] = table->iterNode->next;
-      /* Setup the iterator to visit first node of curChain: */
-      table->iterNode  = NULL;
-      table->iterChain = curChain;
-   } else {
-      /* iterNode is somewhere inside curChain chain */
-      VgHashNode* prev = table->chains[curChain];
-
-      while (prev->next != table->iterNode)
-         prev = prev->next;
-      /* Remove iterNode from the chain. */
-      prev->next = table->iterNode->next;
-      /* Setup the iterator to visit prev->next, which is the node
-         that was after the deleted node. */
-      table->iterNode = prev;
-   }
-
+   table->iterNode = NULL;
    table->n_elements--;
 }
 
@@ -419,13 +438,13 @@ void VG_(HT_destruct)(VgHashTable *table, void(*freenode_fn)(void*))
    UInt       i;
    VgHashNode *node, *node_next;
 
-   for (i = 0; i < table->n_chains; i++) {
-      for (node = table->chains[i]; node != NULL; node = node_next) {
-         node_next = node->next;
+   for (i = 0; i < table->max_size; i++) {
+      node =  table->chain[i];
+      if (node != NULL) {
          freenode_fn(node);
       }
    }
-   VG_(free)(table->chains);
+   VG_(free)(table->chain);
    VG_(free)(table);
 }
 
